@@ -115,7 +115,13 @@ except ImportError:
     PLAYWRIGHT_OK = False
 
 # ── Persistence (Railway volume at /app/data; local folder otherwise) ─────────
-_DATA_DIR   = "/app/data" if os.path.isdir("/app/data") else "."
+# Railway sets RAILWAY_VOLUME_MOUNT_PATH automatically when a volume is attached — use it wherever it's mounted
+_DATA_DIR   = (os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+               or ("/app/data" if os.path.isdir("/app/data") else "."))
+try:
+    os.makedirs(_DATA_DIR, exist_ok=True)
+except Exception:
+    _DATA_DIR = "."
 STATE_FILE  = os.path.join(_DATA_DIR, "mdgen_state.json")
 CONFIG_FILE = os.path.join(_DATA_DIR, "mdgen_config.json")
 URLS_FILE   = os.path.join(_DATA_DIR, "mdgen_urls.json")
@@ -872,6 +878,8 @@ class Handler(BaseHTTPRequestHandler):
                 "countiesWithMethodData": {r: sorted(latest["races"][r]["countyMethod"].keys()) for r in RACE_KEYS},
                 "apCounties": {r: latest["races"][r]["apEevp"] for r in RACE_KEYS},
                 "unresolvedDrops": {r: {k: {"ts": v.get("ts"), "cycles": v.get("cycles")} for k, v in _unresolved[r].items()} for r in RACE_KEYS},
+                "dataDir": _DATA_DIR,
+                "volumeMountPath": os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or "(no volume detected)",
                 "files": {f: (f"{round(os.path.getsize(f)/1024, 1)} KB" if os.path.exists(f) else "missing")
                           for f in (STATE_FILE, CONFIG_FILE, URLS_FILE)},
             }
