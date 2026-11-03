@@ -24,7 +24,7 @@ ENDPOINTS
 RUN LOCALLY:  python3 MD_General_Scraper.py   (then open http://localhost:8765)
 """
 
-import urllib.request, urllib.error, json, time, threading, re, os, datetime, concurrent.futures
+import urllib.request, urllib.error, json, time, threading, re, os, sys, signal, subprocess, datetime, concurrent.futures
 
 try:
     from zoneinfo import ZoneInfo
@@ -704,33 +704,43 @@ def scrape_ap():
             urls.append(u)
     if not urls:
         return
+    # Run the browser in a throw-away child process. If it hangs, the whole process group
+    # (including Chromium) is killed, so stuck browsers can't pile up and eat memory.
     captured = {}
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            for u in urls:
-                page = browser.new_page(viewport={"width": 1280, "height": 900})
-
-                def on_response(resp):
-                    try:
-                        if "apelections.org" in resp.url or "/races/MD/" in resp.url:
-                            captured[resp.url.split("?")[0]] = resp.text()
-                    except Exception:
-                        pass
-                page.on("response", on_response)
-                try:
-                    page.goto(u, wait_until="domcontentloaded", timeout=30000)
-                    for frac in (0.25, 0.5, 0.75, 1.0):
-                        page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {frac})")
-                        page.wait_for_timeout(2000)
-                    _ap_debug["urls"][u] = "ok"
-                except Exception as e:
-                    _ap_debug["urls"][u] = f"error: {e}"
-                page.close()
-            browser.close()
+        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--ap-child", json.dumps(urls)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            out, err = proc.communicate(timeout=AP_CHILD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            # Child is still alive, so its process group (child + Chromium) is valid — kill only that group
+            try:
+                if os.getpgid(proc.pid) == proc.pid and proc.pid != os.getpgrp():
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except Exception:
+                proc.kill()
+            try:
+                proc.communicate(timeout=10)
+            except Exception:
+                pass
+            _ap_debug["last_error"] = f"AP browser timed out after {AP_CHILD_TIMEOUT}s — killed"
+            print(f"[AP] Browser timed out after {AP_CHILD_TIMEOUT}s — killed it, will retry")
+            return
+        text = out.decode("utf-8", "replace")
+        mark = text.rfind("@@AP_JSON@@")
+        if mark == -1:
+            _ap_debug["last_error"] = "AP child returned no data: " + err.decode("utf-8", "replace")[-300:]
+            print(f"[AP] {_ap_debug['last_error']}")
+            return
+        payload = json.loads(text[mark + len("@@AP_JSON@@"):])
+        captured = payload.get("captured", {})
+        _ap_debug["urls"].update(payload.get("urls", {}))
+        _ap_debug["last_error"] = payload.get("error")
     except Exception as e:
         _ap_debug["last_error"] = str(e)
-        print(f"[AP] Browser error: {e}")
+        print(f"[AP] Error: {e}")
         return
 
     res = parse_ap_captured(captured)
@@ -750,6 +760,55 @@ def scrape_ap():
                                          for k, v in res.items()))
     else:
         print(f"[AP] No MD race data captured ({len(captured)} AP files seen). Check AP URLs in /debug.")
+
+
+AP_CHILD_TIMEOUT = int(os.environ.get("AP_CHILD_TIMEOUT", 90))
+
+
+def _ap_child_capture(urls):
+    """Runs inside the child process: open each AP page, collect AP's data files."""
+    captured, url_status, error = {}, {}, None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            for u in urls:
+                page = browser.new_page(viewport={"width": 1280, "height": 900})
+
+                def on_response(resp):
+                    try:
+                        if "apelections.org" in resp.url or "/races/MD/" in resp.url:
+                            captured[resp.url.split("?")[0]] = resp.text()
+                    except Exception:
+                        pass
+                page.on("response", on_response)
+                try:
+                    page.goto(u, wait_until="domcontentloaded", timeout=30000)
+                    for frac in (0.25, 0.5, 0.75, 1.0):
+                        page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {frac})")
+                        page.wait_for_timeout(2000)
+                    url_status[u] = "ok"
+                except Exception as e:
+                    url_status[u] = f"error: {e}"
+                page.close()
+            browser.close()
+    except Exception as e:
+        error = str(e)
+    return {"captured": captured, "urls": url_status, "error": error}
+
+
+# ── Watchdog: if the SBOE loop stops making progress, exit so Railway restarts us ──
+_last_progress = time.time()
+WATCHDOG_SECS = int(os.environ.get("WATCHDOG_SECS", 300))
+
+
+def watchdog_loop():
+    while True:
+        time.sleep(30)
+        stalled = time.time() - _last_progress
+        if stalled > WATCHDOG_SECS:
+            print(f"[Watchdog] No SBOE progress for {int(stalled)}s — exiting so Railway restarts the service")
+            sys.stdout.flush()
+            os._exit(1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -794,11 +853,13 @@ def sboe_cycle():
 
 
 def sboe_loop():
+    global _last_progress
     while True:
         try:
             sboe_cycle()
         except Exception as e:
             print(f"SBOE loop error: {e}")
+        _last_progress = time.time()
         time.sleep(SBOE_REFRESH_SECS)
 
 
@@ -809,9 +870,9 @@ def ap_loop():
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                 fut = ex.submit(scrape_ap)
                 try:
-                    fut.result(timeout=120)
+                    fut.result(timeout=AP_CHILD_TIMEOUT + 30)
                 except concurrent.futures.TimeoutError:
-                    print("[AP] Scrape timed out after 120s — skipping cycle")
+                    print("[AP] Scrape cycle timed out — skipping")
         except Exception as e:
             print(f"[AP] Loop error: {e}")
         time.sleep(AP_REFRESH_SECS)
@@ -965,6 +1026,12 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+if __name__ == "__main__" and len(sys.argv) > 2 and sys.argv[1] == "--ap-child":
+    _res = _ap_child_capture(json.loads(sys.argv[2]))
+    sys.stdout.write("@@AP_JSON@@" + json.dumps(_res))
+    sys.stdout.flush()
+    os._exit(0)
+
 if __name__ == "__main__":
     print("=" * 64)
     print("  Maryland 2026 General — Governor + Question 3 scraper")
@@ -975,6 +1042,7 @@ if __name__ == "__main__":
         print("  ⚠️  Playwright not installed — AP % reporting disabled.")
     print("=" * 64)
     threading.Thread(target=sboe_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
     if os.environ.get("DISABLE_AP") != "1":
         threading.Thread(target=ap_loop, daemon=True).start()
     try:
