@@ -473,7 +473,7 @@
         <button class="btn sm secondary" id="ballotSetupToggle" onclick="toggleBallotSetup()">Hide ▲</button>
       </div>
       <div id="ballotSetupBody">
-        <p class="helper-text">Enter the ballot universe for each county from SBOE pre-election canvass data. <strong>Mail</strong> = VBMs received as of election day. <strong>Early</strong> = votes cast during early voting (this is complete before election day). <strong>Est. ED</strong> = your estimated election day in-person turnout.</p>
+        <p class="helper-text">Enter the ballot universe for each county from SBOE pre-election canvass data. <strong>Mail</strong> = VBMs received as of election day. <strong>Early</strong> = votes cast during early voting (this is complete before election day). <strong>Est. ED</strong> = your estimated election day in-person turnout. Leave a box blank and the tracker uses <strong>AP's expected vote</strong> for that county and method.</p>
         <div id="ballotUniverseSetup"></div>
       </div>
     </div>
@@ -1594,9 +1594,13 @@ function computeMethodModel() {
     const U = gov.ballotUniverse?.[co.id] || {};
     const r = gov.results[co.id] || {};
     const ap = r.apPctReporting || 0, rep = r.totalReported || 0;
-    const expTot = Math.max(Gtot, (ap > 0 && rep > 0) ? rep / (ap / 100) : (co.expectedTurnout || 0));
-    const E = { mail: Math.max(G.mail, U.mail || 0), early: Math.max(G.early, U.early || 0), provisional: G.provisional };
-    E.ed = (U.ed || 0) > 0 ? Math.max(G.ed, U.ed) : Math.max(G.ed, expTot - E.mail - E.early - G.provisional);
+    const axk = findKeyFor(gov.lastFetch?.apExpected || {}, co.name);
+    const APX = axk ? gov.lastFetch.apExpected[axk] : null;          // AP's expected votes by method
+    const expTot = Math.max(Gtot, (ap > 0 && rep > 0) ? rep / (ap / 100) : (APX?.total || co.expectedTurnout || 0));
+    const E = { mail: Math.max(G.mail, U.mail || APX?.mail || 0), early: Math.max(G.early, U.early || APX?.early || 0), provisional: G.provisional };
+    E.ed = (U.ed || 0) > 0 ? Math.max(G.ed, U.ed)
+         : (APX?.ed > 0) ? Math.max(G.ed, APX.ed)
+         : Math.max(G.ed, expTot - E.mail - E.early - G.provisional);
 
     const b = M22[co.name];
     const evvbmG = G.mail + G.early, evvbmM = Mo.mail + Mo.early;
@@ -1727,7 +1731,7 @@ function buildMethodModelHtml() {
       <p class="helper-text">${isQ
         ? 'Election Day For = Moore\'s projected Election Day share + the For-vs-Moore gap in that county\'s early + mail votes (applied proportionally, so the gap shrinks where Moore is very weak or very strong). As Election Day votes are counted, the actual Election Day gap takes over. Q3 ballots left = governor ballots left × the roll-off seen so far.'
         : 'Moore\'s Election Day share = his early + mail share in that county + that county\'s 2022 Election Day shift (applied proportionally). Actual Election Day results take over as they\'re counted (speed set by the blend weight in Setup).'}
-        Ballots left use the Ballot Universe tab if filled in; otherwise expected turnout (or AP's implied total) minus what's counted.</p>
+        Ballots left = expected ballots by method minus what's counted. Expected comes from the Ballot Universe tab if you fill it in, otherwise AP's expected vote by method for each county.</p>
       <div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:14px;padding:10px 12px;background:var(--card2);border-radius:8px">
         ${slider('edShiftAdj', 'Election Day shift adjustment', 'Added to every county\'s 2022 shift. Negative = Moore does worse on Election Day than 2022\'s pattern. Affects both races.')}
         ${isQ ? slider('gapAdj', 'Q3 Election Day gap adjustment', 'Added to the early + mail gap. Negative = For falls further behind Moore on Election Day.') : ''}
@@ -1862,6 +1866,10 @@ function applyScraperData(data, log, raceKey) {
       if (!state.lastFetch) state.lastFetch = {};
       state.lastFetch.apTs = data.apTs;
     }
+  }
+  if (data.apExpected && Object.keys(data.apExpected).length) {
+    if (!state.lastFetch) state.lastFetch = {};
+    state.lastFetch.apExpected = data.apExpected;   // AP expected votes by method, per county
   }
   if (data.apStatewide && Object.keys(data.apStatewide).length) {
     if (!state.lastFetch) state.lastFetch = {};
@@ -3695,11 +3703,13 @@ function renderBallotsTab() {
     // Match county name to scraper data (flexible name matching)
     const scraperKey = findKeyFor(countyMethod, co.name);
     const counted = scraperKey ? countyMethod[scraperKey] : {};
+    const apxK = findKeyFor(state.lastFetch?.apExpected || {}, co.name);
+    const apx = apxK ? state.lastFetch.apExpected[apxK] : {};
 
     html += `<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-weight:600">${co.name}</td>`;
 
     methods.forEach(m => {
-      const universe = m.hasUniverse ? (u[m.key] || 0) : null;
+      const universe = m.hasUniverse ? (u[m.key] || apx[m.key] || 0) : null;
       const cnt      = counted[m.key] || 0;
       const out      = universe !== null ? Math.max(0, universe - cnt) : null;
       const pctIn    = universe > 0 ? Math.min(100, cnt/universe*100) : (cnt > 0 && universe === null ? null : (universe === 0 && cnt > 0 ? 100 : null));

@@ -19,7 +19,7 @@ Built from the MD-6 primary tracker. It looks the same and uses the same tabs, d
 These file names follow SBOE's 2022/2024 pattern. They can't be confirmed until SBOE posts tonight.
 
 **AP**: the % of expected vote counted for each county and statewide, plus AP's vote totals. These drive "AP implies X total turnout" and the projections.
-- ⚠️ **The AP page links are guesses.** On election night, copy the real apnews.com results page for each race. Then go to Setup → Live Data, paste it into **AP results page URL**, and press **📤 Send URLs to scraper**. You must be unlocked as Admin. No redeploy is needed.
+- AP pages (built in): `https://apnews.com/projects/elections-2026/maryland-governor-results/` and `https://apnews.com/projects/elections-2026/maryland-question-3-results/`. The scraper reads AP's background data file, which includes all 24 counties (even the ones hidden behind the "show more" arrow), plus AP's expected vote by method for each county. The tracker uses those as the ballot universe when you leave the Ballot Universe boxes blank.
 - The scraper tells Question 3 apart from Questions 1 and 2 using AP's race info. To see what it found, open the **Open scraper debug ↗** link (`/debug`) and look under `ap.races_seen`.
 
 ## Election-night checklist

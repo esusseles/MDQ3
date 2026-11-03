@@ -55,8 +55,9 @@ SBOE_BASES = [b.strip() for b in os.environ.get("SBOE_BASES", ",".join([
 
 # AP results pages. The scraper opens these in a headless browser and listens for
 # AP's data files. PASTE THE REAL LINKS from apnews.com into the tracker on election night.
-AP_URL_GOV = os.environ.get("AP_URL_GOV", "https://apnews.com/projects/elections-2026/maryland-general-results-governor/")
-AP_URL_Q3  = os.environ.get("AP_URL_Q3",  "https://apnews.com/projects/elections-2026/maryland-general-results-ballot-measures/")
+AP_URL_GOV = os.environ.get("AP_URL_GOV", "https://apnews.com/projects/elections-2026/maryland-governor-results/")
+AP_URL_Q3  = os.environ.get("AP_URL_Q3",  "https://apnews.com/projects/elections-2026/maryland-question-3-results/")
+AP_EVENT_DATE = os.environ.get("AP_EVENT_DATE", "20261103")   # ignore older races the AP page also loads (e.g. 2024)
 
 SBOE_REFRESH_SECS          = int(os.environ.get("SBOE_REFRESH_SECS", 5))    # statewide + county-breakdown pages
 COUNTY_METHOD_REFRESH_SECS = int(os.environ.get("COUNTY_METHOD_REFRESH_SECS", 15))  # 24 by-county pages × 2 races
@@ -176,7 +177,7 @@ def ap_url(race):
 
 def _empty_race():
     return {"method": {}, "county": {}, "countyMethod": {}, "precincts": {},
-            "apEevp": {}, "apTotalVotes": {}, "apStatewide": {}, "apTs": None, "ts": None}
+            "apEevp": {}, "apTotalVotes": {}, "apStatewide": {}, "apExpected": {}, "apTs": None, "ts": None}
 
 
 latest = {
@@ -618,6 +619,8 @@ def parse_ap_captured(captured):
         if not m:
             continue
         rid = m.group(1)
+        if AP_EVENT_DATE and not rid.startswith(AP_EVENT_DATE):
+            continue
         try:
             meta = json.loads(body)
         except Exception:
@@ -645,7 +648,19 @@ def parse_ap_captured(captured):
             units = data.get("reportingUnits") if isinstance(data, dict) and isinstance(data.get("reportingUnits"), list) else None
             items = [(u.get("fipsCode") or u.get("reportingunitID"), u) for u in units] if units else \
                     (list(data.items()) if isinstance(data, dict) else [])
-            eevp, total, statewide = {}, {}, {}
+            eevp, total, statewide, expected = {}, {}, {}, {}
+
+            def _expected(unit):
+                """AP's expected vote by method: parameters.vote.expected.voteTypes"""
+                ex = ((unit.get("parameters") or {}).get("vote") or {}).get("expected") or {}
+                vt = ex.get("voteTypes") or {}
+                if not ex:
+                    return None
+                return {"total": ex.get("actual") or 0, "mail": vt.get("absenteeMail") or 0,
+                        "early": vt.get("advanceInPerson") or 0, "ed": vt.get("electionDayInPerson") or 0,
+                        "provisional": vt.get("provisional") or 0,
+                        "eevpByMethod": {"mail": unit.get("eevpAbsenteeMail"), "early": unit.get("eevpAdvanceInPerson"),
+                                         "ed": unit.get("eevpEdayInPerson"), "provisional": unit.get("eevpProvisional")}}
             for ukey, unit in items:
                 if not isinstance(unit, dict):
                     continue
@@ -655,16 +670,19 @@ def parse_ap_captured(captured):
                 lvl = str(unit.get("reportingunitLevel") or unit.get("level") or "")
                 nm = str(unit.get("reportingunitName") or "")
                 if str(ukey) in ("24", "MD", "state") or lvl in ("1", "state") or nm in ("Maryland", "MD"):
-                    statewide = {"eevp": float(ev) if ev is not None else None, "total": tv}
+                    statewide = {"eevp": float(ev) if ev is not None else None, "total": tv, "expected": _expected(unit)}
                     continue
                 county = _county_from_ap(ukey, unit)
                 if not county or county in eevp:
                     continue
                 if ev is not None:
                     eevp[county] = float(ev)
+                    ex = _expected(unit)
+                    if ex:
+                        expected[county] = ex
                     total[county] = tv
             if eevp or statewide:
-                results[key] = {"eevp": eevp, "total": total, "statewide": statewide, "raceId": rid}
+                results[key] = {"eevp": eevp, "total": total, "statewide": statewide, "expected": expected, "raceId": rid}
             break
     return results
 
@@ -717,6 +735,7 @@ def scrape_ap():
             out["apEevp"] = r["eevp"]
             out["apTotalVotes"] = r["total"]
             out["apStatewide"] = r["statewide"]
+            out["apExpected"] = r.get("expected", {})
             out["apTs"] = ts
         if res:
             latest["apTs"] = ts
